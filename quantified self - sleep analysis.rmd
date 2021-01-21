@@ -1,0 +1,579 @@
+---
+title: "Analysis of Daily Sleep for 887 Days"
+output: html_document
+Author: Xiao Yang
+
+
+---
+
+# Overview
+
+## Data source
+This impressive longitudinal daily sleep dataset was graciously shared on Kaggle https://www.kaggle.com/danagerous/sleep-data. 
+
+This dataset not only includes sleep-related characteristics (e.g., quality, start/end time), but also includes a few behavioral variables that might influence sleep, such as caffeine intake, physical activity, wake-up mood, stress, etc. These variables together are likely to influence each other, e.g., caffeine intake can cause poor sleep quality and poor sleep quality can lead to the next day's caffeine intake. 
+
+## Goal
+My interest, as a quanitative psychologist and data scientist, is to figure out what are the key factors that influence sleep quality, and provide **personalized suggestion** to inform the individual about their sleep.  
+
+## Outline
+First, I explore the data and check the basics (e.g., time-trend, missingness, outliers). 
+
+Then, I apply network control method to find the behavior modification that might prevent poor sleep quality. 
+
+
+
+# 0. Read in data and invoke libraries/packages
+```{r}
+library(ggplot2)# for data viz
+library(psych) # for descriptives
+library(lubridate) # for handling dates
+library(stringr) # for manipulating strings
+library(reshape2) # for data wrangling
+library(dplyr) # for data wrangling
+library(metafolio) # for color
+library(BoolNet) # for boolean network 
+library(igraph) # for network graph plotting
+
+sleep <- read.csv("C:/Users/Xiao Yang/Downloads/archive/sleepdata.csv")
+names(sleep) <- tolower(names(sleep))
+
+# # change some variable names 
+# rename
+
+head(sleep)
+
+str(sleep)
+
+```
+
+# 1. Create new variables
+
+By the first look at the data, I want to create a few variables to make sure the data is in more analyzable format, which includes:
+
+1. time variables of start and end time of sleep
+
+2. time variables to indicate the hour of sleep 
+
+3. behavior variables that indicate caffeine intake
+
+4. convert data types from string to numeric if needed
+
+
+## reformat sleep start time and end time to make sure the computer can understand it 
+
+
+```{r}
+sleep$day <- rep(NA, nrow(sleep))
+sleep$month <- rep(NA, nrow(sleep))
+sleep$year <- rep(NA, nrow(sleep))
+sleep$hour_minute <- rep(NA, nrow(sleep))
+for (row in 1:nrow(sleep)){
+  sleep$month[row]  <- strsplit(sleep$start[row], "/")[[1]][1]
+  sleep$day[row]  <- strsplit(sleep$start[row], "/")[[1]][2]
+  sleep$year[row]  <- substr(strsplit(sleep$start[row], "/")[[1]][3],1,4)
+  sleep$hour_minute[row]  <- strsplit(sleep$start[row], " ")[[1]][2]
+  }
+
+# we have to make the day double-digit to ensure as.posixCT could process it
+for (digit in 1:9){
+  sleep$day <- ifelse(nchar(sleep$day)==1,
+                            str_replace(sleep$day, as.character(digit), 
+                                        paste("0", as.character(digit), sep = "")),
+                            sleep$day)
+  
+  sleep$month <- ifelse(nchar(sleep$month)==1,
+                            str_replace(sleep$month, as.character(digit), 
+                                        paste("0", as.character(digit), sep = "")),
+                            sleep$month)
+}
+
+ 
+sleep$start_posix <- as.POSIXct(paste(paste(sleep$year, 
+                                      sleep$month,
+                                      sleep$day, 
+                                      sep = "-"), 
+                                      sleep$hour_minute, sep = " "),  pattern = "%Y-%m-%d %H:%M")
+
+sleep$start_hour <- hour(sleep$start_posix)
+
+
+# date
+sleep$date <- date(sleep$start_posix)
+
+
+# day of week
+sleep$wday <- wday(sleep$start_posix)
+
+# remove the intermediate variables to avoid name clashing
+sleep$day <- NULL
+sleep$month <- NULL
+sleep$year <- NULL
+sleep$hour_minute <- NULL
+```
+
+## do the same procedure for sleep end time
+```{r}
+sleep$day <- rep(NA, nrow(sleep))
+sleep$month <- rep(NA, nrow(sleep))
+sleep$year <- rep(NA, nrow(sleep))
+sleep$hour_minute <- rep(NA, nrow(sleep))
+for (row in 1:nrow(sleep)){
+  sleep$month[row]  <- strsplit(sleep$end[row], "/")[[1]][1]
+  sleep$day[row]  <- strsplit(sleep$end[row], "/")[[1]][2]
+  sleep$year[row]  <- substr(strsplit(sleep$end[row], "/")[[1]][3],1,4)
+  sleep$hour_minute[row]  <- strsplit(sleep$end[row], " ")[[1]][2]
+  }
+
+# we have to make the day double-digit to ensure as.posixCT could process it
+for (digit in 1:9){
+  sleep$day <- ifelse(nchar(sleep$day)==1,
+                            str_replace(sleep$day, as.character(digit), 
+                                        paste("0", as.character(digit), sep = "")),
+                            sleep$day)
+  
+  sleep$month <- ifelse(nchar(sleep$month)==1,
+                            str_replace(sleep$month, as.character(digit), 
+                                        paste("0", as.character(digit), sep = "")),
+                            sleep$month)
+}
+
+
+sleep$end_posix <- as.POSIXct(paste(paste(sleep$year, 
+                                      sleep$month,
+                                      sleep$day, 
+                                      sep = "-"), 
+                                      sleep$hour_minute, sep = " "),  pattern = "%Y-%m-%d %H:%M")
+
+sleep$end_hour <- hour(sleep$end_posix)
+
+# remove the intermediate variables to avoid name clashing
+sleep$day <- NULL
+sleep$month <- NULL
+sleep$year <- NULL
+sleep$hour_minute <- NULL
+```
+
+## compute sleep duration based on the posix 
+```{r}
+sleep$duration <- difftime(sleep$end_posix, sleep$start_posix, units = "mins")
+sleep$duration <- as.numeric(sleep$duration)
+
+```
+
+## convert variable type from character to numeric
+```{r}
+# remove the % sign
+sleep$sleep.quality <- as.numeric(substr(sleep$sleep.quality, 1, nchar(sleep$sleep.quality)-1))
+
+sleep$activity..steps. <- as.numeric(sleep$activity..steps.)
+sleep$heart.rate <- as.numeric(sleep$heart.rate)
+```
+
+
+## convert note variables to the following variables:
+
+The pattern in the notes are "drank tea/coffee", so I detect tea/coffee to indicate if there was tea/coffee intake. Similarly, I create new variables of work_out and stress, if there are strings matched with "worked out" or "stress". 
+
+I also recoded the wake-up mood as follows:
+
+":)" recoded as 3
+
+":|" recoded as 2
+
+":(" recoded as 1
+
+```{r}
+# decapitalize the note column 
+sleep$sleep.notes <- tolower(sleep$sleep.notes)
+
+
+sleep$tea <- ifelse(str_detect(sleep$sleep.notes,"tea"), 1, 0)
+sleep$coffee <- ifelse(str_detect(sleep$sleep.notes,"coffee"), 1, 0)
+
+# similar with work out and stress
+sleep$work_out <- ifelse(str_detect(sleep$sleep.notes,"worked out"), 1, 0)
+sleep$stress <- ifelse(str_detect(sleep$sleep.notes,"stress"), 1, 0)
+
+
+# similar with wake up mood
+sleep$wake_up_mood <-case_when(
+  sleep$wake.up == ":)" ~ 3,
+  sleep$wake.up == ":|" ~ 2,
+  sleep$wake.up == ":(" ~ 1,
+)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+# 2. Data visualization and checking data
+
+## plot the sleep quality by date
+```{r}
+ggplot(data = sleep, aes(x = date, y = sleep.quality))+
+  geom_point() +
+  geom_line() + 
+  theme_classic()
+```
+
+
+## Prelim finding:
+We can see most days sleep are good, but there are some days with bad sleep quality, **especially a period of time in the later part of 2016**. 
+
+## check sleep duration distribution
+```{r}
+ggplot(data = sleep, aes(x =  duration))+
+  geom_histogram() + 
+  theme_classic()
+describe(as.numeric(sleep$duration))
+```
+
+## Prelim finding:
+Average sleep time is a bit less than 8 hours (pretty good!), while the longest is almost 11 hours, and the shortest is 15 minutes. 
+
+
+
+## Check sleep duration distribution
+```{r}
+ggplot(data = sleep, aes(x =  duration))+
+  geom_histogram() + 
+  theme_classic()
+
+```
+
+## Check heart rate distribution, e.g., if there are outliers
+```{r}
+ggplot(data = sleep, aes(x =  heart.rate))+
+  geom_histogram() + 
+  theme_classic()
+```
+
+Looking ok. 
+
+## Check steps distribution, e.g., if there are outliers
+```{r}
+ggplot(data = sleep, aes(x =  activity..steps.))+
+  geom_histogram() + 
+  theme_classic()
+```
+
+Looking ok. Zero-inflated (a lot of zeros). 
+
+
+
+## Let's see if there are some patterns in the bad sleep quality days.  
+
+### What could affect sleep quality?
+1. onset time/hour of sleep, e.g., sleeping late might cause reduction of sleep time and hence bad quality 
+
+2. caffeine intake during the day before sleep time
+
+3. day of the week, e.g., Friday might sleep later than usual, causing poorer quality 
+
+4. physical activity, e.g., physical activity might improve sleep quality 
+
+5. stress
+
+6. some more distal factors, e.g., heart rate 
+
+
+## Onset time/hour of sleep
+```{r}
+
+ggplot(data = sleep, aes(x = start_hour, y = sleep.quality))+
+  geom_point()
+
+```
+
+## Prelim finding:
+We can clearly see, if the sleep starting time is late, e.g., later than 2am, then the sleep quality is low, e.g., less than 30 out of 100. 
+
+
+```{r}
+
+ggplot(data = sleep, aes(x = end_hour, y = sleep.quality))+
+  geom_point()
+
+```
+## Prelim finding:
+Since we don't know if the end hour is 21pm, if the person went back to sleep or not, it is hard to conclude how sleep quality is dependent on sleep offset hour.  
+
+
+```{r}
+
+ggplot(data = sleep, aes(x = duration, y = sleep.quality))+
+  geom_point()
+
+```
+
+## Prelim finding:
+
+Clear indication that the general trend is longer sleep is associated with higher qualities, with some variations with longer sleep duration (e.g., when sleep duration is longer than 300 minutes, the variation of sleep quality gets bigger). 
+
+While it is definitely bad for sleep quality when the person sleeps less than 3 hours, the incease of variaiblity implies other factors are at play when the person sleep for longer hours. Let's see which factors might have impacted the sleep quality when the duration is longer than 5 hours. 
+
+
+
+## caffeine intake
+```{r}
+
+ggplot(data = sleep, aes(x = duration, y = sleep.quality, color = factor(coffee)))+
+  geom_point()
+
+```
+
+
+```{r}
+
+ggplot(data = sleep, aes(x = duration, y = sleep.quality, color = factor(tea)))+
+  geom_point()
+
+```
+
+```{r}
+
+ggplot(data = sleep, aes(x = duration, y = sleep.quality, color = factor(stress)))+
+  geom_point()
+
+```
+
+```{r}
+
+ggplot(data = sleep, aes(x = duration, y = sleep.quality, color = factor(work_out)))+
+  geom_point()
+
+```
+
+## Prelim finding:
+It does not seem like coffee, tea, stress, or workout would drive sleep quality down definitively....
+
+
+
+```{r}
+
+ggplot(data = sleep, aes(x = factor(wday), y = sleep.quality))+
+  geom_boxplot()
+
+```
+
+## Prelim finding:
+It seems like very day in the week could have some bad quality of sleep. 
+
+
+
+```{r}
+
+ggplot(data = sleep, aes(x = heart.rate, y = sleep.quality))+
+  geom_point()
+
+```
+
+## Prelim finding:
+No clear association between heart rate and sleep quality. 
+
+
+```{r}
+
+ggplot(data = sleep, aes(x = activity..steps., y = sleep.quality))+
+  geom_point()
+
+```
+
+## Prelim finding:
+No clear association between activity steps and sleep quality. 
+
+## seasonality
+```{r}
+sleep$month <- month(sleep$start_posix)
+ggplot(data = sleep, aes(x = month, y = sleep.quality))+
+  geom_boxplot()
+
+```
+
+## Prelim finding:
+It seems like there is no seasonality effect in terms of sleep quality 
+
+
+```{r}
+
+ggplot(data = sleep, aes(x = month , y = start_hour))+
+  geom_boxplot()
+
+```
+
+## Prelim finding:
+Some november days have later sleeping onset hour.  
+
+
+
+## plot the time-series data 
+```{r}
+
+sleep_for_plot <- sleep[c("date", "sleep.quality","heart.rate","activity..steps."                                 )
+                            ]
+
+sleep_for_plot_long <- melt(sleep_for_plot, id.vars = "date")
+
+ggplot(data = sleep_for_plot_long, aes(x = date, y = value, group = variable, color = variable))+
+  geom_point()+
+  geom_line()+
+  facet_wrap(~variable, 
+             scale = "free", 
+             ncol = 1)
+```
+
+
+## Prelim finding:
+Ahh, heart rate log stopped at around the beginning of 2016, and activity steps did not start until late 2016. 
+
+
+
+
+# 2. Are there some behavior modification that can improve sleep quality?
+
+I apply the Boolean network method on this dataset. The Boolean network method can estimate the temporal relations among mulitple varibles, and the temporal relations mean how variables affect each other with a time-lag, e.g., how sleep yesterday affects caffeine intake today. 
+
+The nice feature of the Boolean network is that we can also uncover the '**sleep quality landscape**, by which we can see whether the person could be stuck in a "bad sleep" state. Based on this, I can also find which behavior modification to inform the person to improve sleep quality.
+
+### Note: 
+
+In order to fit the Boolean network model, I had to convert the sleep quality into a binary variable, so I used the person-mean as a cutoff line, e.g., if it is above mean sleep quality (75), sleep quality is 1; otherwise 0.
+
+```{r}
+describe(sleep$sleep.quality)
+sleep$sleep.quality_bin <- ifelse(sleep$sleep.quality>=75, 1, 0 ) # use person-mean to binarize
+
+
+describe(sleep$heart.rate)
+sleep$heart.rate_bin <- ifelse(sleep$heart.rate>=90, 1, 0 ) 
+
+
+describe(sleep$activity..steps.)
+sleep$heart.rate_bin <- ifelse(sleep$heart.rate>=90, 1, 0 ) 
+
+
+
+cols = gg_color_hue(5)
+sleep_for_analysis <- sleep[c("date",
+                              "sleep.quality_bin",
+                              # "heart.rate_bin","activity..steps.", 
+                              # "wday", "start_hour", "duration", 
+                              "tea", "coffee", "stress", "work_out"
+                              )
+                            ]
+
+sleep_for_analysis_melt <- melt(sleep_for_analysis,id = "date")
+
+sleep_for_analysis_melt$value.variable <- ifelse(sleep_for_analysis_melt$value==0,"0",                                        as.character(sleep_for_analysis_melt$variable))
+    
+sleep_for_analysis_melt$value.variable <- factor(sleep_for_analysis_melt$value.variable,
+                                            levels = c("0",
+                                                       "sleep.quality_bin",
+                                                       "tea", "coffee", "stress", "work_out"))
+
+ggplot(data = sleep_for_analysis_melt)+
+        geom_rect(aes(xmin = date - .5, xmax = date + .5,
+                      ymin = 0, ymax = 1, fill = factor( value.variable)))+
+   facet_wrap(~variable, ncol = 1) +
+  scale_fill_manual(values = c("#FFFFFF", cols))+
+  theme(
+    strip.background = element_blank(),
+    panel.background = element_blank(),
+    legend.title =   element_blank(),
+    legend.key = element_blank(),
+    legend.position = "none",
+    axis.text.y=element_text(color="black",size=12),
+    axis.text.x=element_text(color="black",size=12),
+    axis.title.y=element_text(color="black",size=12),
+    axis.title.x=element_text(color="black",size=12),
+    axis.line = element_line(color = 'black'))+
+  ylim(0,1)+
+  xlab("Time") 
+```
+
+## Prelim finding:
+We can also see more clearly the data about caffeine intake, stress, and work out are probably not entered since mid 2017. 
+
+## Select the part of data before May 2017 (in case the later part of data are missing)
+```{r}
+
+sleep_for_analysis <- sleep_for_analysis[
+    sleep_for_analysis$date <as.POSIXct("2017-05-01", pattern = "%Y-%m-%d"), ]
+```
+
+## Construct Boolean network
+```{r}
+sleep_for_analysis$date <- NULL
+
+net.data <- t(sleep_for_analysis)
+network.size<- 5
+
+booleannet <- reconstructNetwork(net.data,
+                          method = "bestfit",
+                          maxK = 2,
+                          readableFunctions=T,
+                          returnPBN = F)
+print(booleannet)
+
+singlenet <- chooseNetwork(booleannet,
+            functionIndices = rep(1,network.size),
+            dontCareValues=rep(1,network.size),
+            readableFunctions=T)
+print(singlenet)
+
+```
+
+## Prelim finding:
+These output are the Boolean functions to describe temporal relations, e.g., 
+
+sleep.quality_bin = (!work_out) | (sleep.quality_bin)
+
+indicates sleep quality = OFF (0) when work out = ON (1) or when sleep quality of yesterday = OFF (0). 
+
+
+## Uncover the sleep quality landscape
+```{r}
+ga <- getAttractors(network = singlenet,
+                  returnTable = TRUE)
+
+p<-plotStateGraph(ga,
+               piecewise=TRUE,
+               drawLabels = T,
+               plotIt = F,
+               colorsAlpha = c(colorBasinsNodeAlpha    = 1,
+                               colorBasinsEdgeAlpha    = 1,
+                               colorAttractorNodeAlpha = 1,
+                               colorAttractorEdgeAlpha = 1))
+plot.igraph(p, 
+            label.cex = 1.2, 
+            vertex.label.color="black", 
+            vertex.label.dist=2, 
+            remove.loops = T,
+            edge.arrow.size=.4)
+
+```
+
+
+## Prelim finding:
+The 5-digit here represent the five variables, which are sleep quality, tea, coffee, stress, work out. 
+
+When the 1st digit is 0, it indicates the sleep quality = 0. 
+
+For the nodes that have self-loops, e.g., 01101 (brown), 00101 (green), that indicates this particular node is an attractor, or the person repeats this state again and again. 
+
+So our goal is to discover if this person could get stuck in bad sleep attractors, and more importantly, how to move this person out of it. 
+
+We can see the state "01101" (brown) which means bad sleep quality, had tea and coffee and worked out, is an attractor. **If working out is turned off when the person did not sleep well and drank tea or coffee**, this person can transition to the state of "01100" (brown) and then goes into "01100" (blue) which will eventually go into a good attractor "11100" (blue) of good sleep quality. 
+
+
+# Conclusion: 
+The suggestion to improve sleep quality is "if you didn't sleep well, give your body an opportunity to recover from that poor sleep and avoid working out, that will allow time for your body to recover and get sleep quality back on track". 
